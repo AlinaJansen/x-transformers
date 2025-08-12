@@ -10,7 +10,7 @@ import torch
 from torch.amp import autocast
 import torch.nn.functional as F
 from torch import nn, einsum, tensor, Tensor, cat, stack, arange, is_tensor
-from torch.utils._pytree import tree_flatten, tree_unflatten, tree_map
+from torch.utils._pytree import tree_flatten, tree_unflatten
 from torch.nn import Module, ModuleList, ModuleDict
 
 from functools import partial, wraps
@@ -47,12 +47,8 @@ class LayerIntermediates:
     layer_hiddens:      list[Tensor] | None = None
     attn_z_loss:        Tensor | None = None
     mems:               Tensor | None = None
-    last_layer_hiddens: Tensor | None = None
-    attn_pooled_tokens: Tensor | None = None
     memory_tokens:      Tensor | None = None
     logit_entropies:    Tensor | None = None
-    logits:             Tensor | None = None
-    cache_length:       int = 0
 
 LinearNoBias = partial(nn.Linear, bias = False)
 
@@ -66,9 +62,6 @@ def default(val, d):
         return val
     return d() if callable(d) else d
 
-def identity(t, *args, **kwargs):
-    return t
-
 def first(it, default = None):
     return it[0] if len(it) > 0 else default
 
@@ -81,13 +74,7 @@ def cast_tuple(val, depth = 1):
 def divisible_by(num, den):
     return (num % den) == 0
 
-def detach_all(obj):
-    return tree_map(lambda t: t.detach() if is_tensor(t) and t.requires_grad else t, obj)
-
-def maybe(fn = None):
-    if not exists(fn):
-        fn = identity
-
+def maybe(fn):
     @wraps(fn)
     def inner(x, *args, **kwargs):
         if not exists(x):
@@ -159,19 +146,6 @@ def or_reduce(masks):
     for rest in body:
         head = head | rest
     return head
-
-# cache helpers
-
-def get_cached_kvs(
-    cache: LayerIntermediates
-) -> list[tuple[Tensor, Tensor]]:
-
-    cached_kvs = []
-
-    for attn_intermediate in cache.attn_intermediates:
-        cached_kvs.append(attn_intermediate.cached_kv)
-
-    return cached_kvs
 
 # entropy
 
@@ -302,18 +276,12 @@ class AbsolutePositionalEmbedding(Module):
         self.l2norm_embed = l2norm_embed
         self.emb = nn.Embedding(max_seq_len, dim)
 
-    def forward(
-        self,
-        x,
-        pos = None,
-        seq_start_pos = None,
-        offset = 0
-    ):
+    def forward(self, x, pos = None, seq_start_pos = None):
         seq_len, device = x.shape[1], x.device
         assert seq_len <= self.max_seq_len, f'you are passing in a sequence length of {seq_len} but your absolute positional embedding has a max sequence length of {self.max_seq_len}'
 
         if not exists(pos):
-            pos = arange(seq_len, device = device) + offset
+            pos = arange(seq_len, device = device)
 
         if exists(seq_start_pos):
             pos = (pos - seq_start_pos[..., None]).clamp(min = 0)
@@ -333,17 +301,11 @@ class ScaledSinusoidalEmbedding(Module):
         inv_freq = theta ** -freq_seq
         self.register_buffer('inv_freq', inv_freq, persistent = False)
 
-    def forward(
-        self,
-        x,
-        pos = None,
-        seq_start_pos = None,
-        offset = 0
-    ):
+    def forward(self, x, pos = None, seq_start_pos = None):
         seq_len, device = x.shape[1], x.device
 
         if not exists(pos):
-            pos = arange(seq_len, device = device) + offset
+            pos = arange(seq_len, device = device)
 
         if exists(seq_start_pos):
             pos = pos - seq_start_pos[..., None]
@@ -708,7 +670,7 @@ class RotaryEmbedding(Module):
         return self.forward(t)
 
     @autocast('cuda', enabled = False)
-    def forward(self, t, offset = 0):
+    def forward(self, t):
         max_pos = t.max() + 1
 
         if t.ndim == 1:
@@ -1111,11 +1073,10 @@ class FoldAxially(Module):
     def forward(
         self,
         x,
-        *args,
         **kwargs
     ):
         if self.axial_dim == 1:
-            return self.fn(x, *args, **kwargs)
+            return self.fn(x, **kwargs)
 
         seq_len, axial_dim = x.shape[1], self.axial_dim
 
@@ -1124,7 +1085,7 @@ class FoldAxially(Module):
 
         x = rearrange(x, 'b (n axial_dim) ... -> (b axial_dim) n ...', axial_dim = axial_dim)
 
-        out = self.fn(x, *args, **kwargs)
+        out = self.fn(x, **kwargs)
 
         (out, *rest_out), tree_spec = tree_flatten(out)
 
@@ -1235,20 +1196,16 @@ class FeedForward(Module):
         glu_mult_bias = False,
         swish = False,
         relu_squared = False,
-        custom_activation = None,
         post_act_ln = False,
         dropout = 0.,
-        sublayer_dropout = 0.,
         no_bias = False,
-        zero_init_output = False,
+        zero_init_output = False
     ):
         super().__init__()
         inner_dim = int(dim * mult)
         dim_out = default(dim_out, dim)
 
-        if exists(custom_activation):
-            activation = deepcopy(custom_activation)
-        elif relu_squared:
+        if relu_squared:
             activation = ReluSquared()
         elif swish:
             activation = nn.SiLU()
@@ -1256,39 +1213,26 @@ class FeedForward(Module):
             activation = nn.GELU()
 
         if glu:
-            proj_in = GLU(dim, inner_dim, activation, mult_bias = glu_mult_bias)
+            project_in = GLU(dim, inner_dim, activation, mult_bias = glu_mult_bias)
         else:
-            proj_in = nn.Sequential(
+            project_in = nn.Sequential(
                 nn.Linear(dim, inner_dim, bias = not no_bias),
                 activation
             )
 
-        proj_out = nn.Linear(inner_dim, dim_out, bias = not no_bias)
-
         self.ff = Sequential(
-            proj_in,
+            project_in,
             LayerNorm(inner_dim) if post_act_ln else None,
             nn.Dropout(dropout),
-            proj_out,
-            nn.Dropout(sublayer_dropout) if sublayer_dropout > 0. else None
+            nn.Linear(inner_dim, dim_out, bias = not no_bias)
         )
 
         # init last linear layer to 0
-
         if zero_init_output:
-            init_zero_(proj_out)
+            init_zero_(self.ff[-1])
 
-    def forward(
-        self,
-        x,
-        deep_embed = None
-    ):
-        out = self.ff(x)
-
-        if exists(deep_embed):
-            out = out * deep_embed
-
-        return out
+    def forward(self, x):
+        return self.ff(x)
 
 # attention. it is all we need
 
@@ -1309,7 +1253,6 @@ class Attention(Module):
         sparse_topk_straight_through = False,
         num_mem_kv = 0,
         dropout = 0.,
-        sublayer_dropout = 0.,
         on_attn = False,
         gate_value_heads = False,
         swiglu_values = False,
@@ -1321,7 +1264,6 @@ class Attention(Module):
         qk_norm_groups = 1,
         qk_norm_scale = 10,
         qk_norm_dim_scale = False,
-        value_rmsnorm = False,      # used in alphagenome and bytedance's GR3 for further stability
         l2_distance = False,
         sigmoid = False,
         selective = False,
@@ -1335,7 +1277,6 @@ class Attention(Module):
         value_dim_head = None,
         dim_out = None,
         add_zero_kv = False,         # same as add_zero_attn in pytorch
-        head_learned_sink = False,
         rotate_num_heads = None,
         data_dependent_alibi = False,
         data_dependent_alibi_per_row = False,
@@ -1477,10 +1418,6 @@ class Attention(Module):
         assert (not qk_norm) or divisible_by(dim_head, qk_norm_groups), 'dimension per attention head must be divisible by the qk norm groups'
         assert not (qk_norm and (dim_head // qk_norm_groups) <= 2), 'the group dimension may be too small (2 was too small in my tests, but 4 still works, surprisingly)'
 
-        # value rms norm
-
-        self.value_rmsnorm = MultiheadRMSNorm(dim_head, heads = heads) if value_rmsnorm else None
-
         # contextual positional encoding
         # https://arxiv.org/html/2405.18719v2
 
@@ -1532,7 +1469,6 @@ class Attention(Module):
             selective = selective,
             custom_attn_fn = custom_attn_fn,
             add_zero_kv = add_zero_kv,
-            head_learned_sink = head_learned_sink,
             flash = flash,
             softclamp_logits = softclamp_logits,
             logit_softclamp_value = logit_softclamp_value,
@@ -1595,10 +1531,6 @@ class Attention(Module):
         dim_out = default(dim_out, dim)
         self.to_out = nn.Sequential(LinearNoBias(out_dim, dim_out * 2), nn.GLU()) if on_attn else LinearNoBias(out_dim, dim_out)
 
-        # sublayer dropout
-
-        self.sublayer_dropout = nn.Dropout(sublayer_dropout) if sublayer_dropout > 0. else None
-
         # the number of attention heads to rotate, for decoupled rope in multi-latent attention
 
         rotate_num_heads = default(rotate_num_heads, heads)
@@ -1635,9 +1567,7 @@ class Attention(Module):
         mem_mask = None,
         return_intermediates = False,
         cache: Intermediates | None = None,
-        value_residual = None,
-        additional_key_values: tuple[Tensor, Tensor] | None = None,
-        additional_key_value_mask = None,
+        value_residual = None
     ):
         b, n, h, kv_h, head_scale, num_mem_kv, device, has_context, qkv_receive_diff_residuals, is_multi_latent_attn = x.shape[0], x.shape[1], self.heads, self.kv_heads, self.head_scale, self.num_mem_kv, x.device, exists(context), self.qkv_receive_diff_residuals, self.use_latent_kv
 
@@ -1723,10 +1653,6 @@ class Attention(Module):
             q = q * self.qk_norm_q_scale
             k = k * self.qk_norm_k_scale
 
-        # maybe value rmsnorm
-
-        v = maybe(self.value_rmsnorm)(v)
-
         # take care of caching
 
         if not is_multi_latent_attn:
@@ -1806,32 +1732,6 @@ class Attention(Module):
 
             if exists(input_mask):
                 input_mask = pad_at_dim(input_mask, (self.num_mem_kv, 0), dim = -1, value = True)
-
-        # maybe append additional key / values
-
-        if exists(additional_key_values):
-            seq_len = k.shape[-2]
-
-            added_k, added_v = additional_key_values
-            added_kv_heads, added_kv_len = added_k.shape[1], added_k.shape[-2]
-
-            # take care of expanding to query heads if mismatch between key / value heads with the ones coming from vlm
-
-            if added_kv_heads != kv_h:
-                assert divisible_by(h, added_kv_heads)
-                k, v, added_k, added_v = tuple(repeat(t, 'b h ... -> b (r h) ...', r = h // t.shape[1]) for t in (k, v, added_k, added_v))
-
-            k = cat((added_k, k), dim = -2)
-            v = cat((added_v, v), dim = -2)
-
-            if (exists(input_mask) or exists(additional_key_value_mask)):
-
-                if not exists(additional_key_value_mask):
-                    input_mask = pad_at_dim(input_mask, (added_kv_len, 0), dim = -1, value = True)
-                elif not exists(input_mask):
-                    input_mask = pad_at_dim(additional_key_value_mask, (0, seq_len), dim = -1, value = True)
-                else:
-                    input_mask = cat((additional_key_value_mask, input_mask), dim = -1)
 
         # determine masking
 
@@ -1929,17 +1829,9 @@ class Attention(Module):
             if not self.causal and exists(self.hybrid_mask_kwarg):
                 hybrid_forward_kwargs = {self.hybrid_mask_kwarg: mask}
 
-            # handle maybe hybrid cache
-
-            hybrid_forward_args = ()
-
-            if exists(cache) and exists(cache.hybrid_hidden):
-                hybrid_hiddens = cache.hybrid_hidden
-                hybrid_forward_args = (hybrid_hiddens,)
-
             # hybrid forward
 
-            hybrid_outputs = self.hybrid_module(x, *hybrid_forward_args, **hybrid_forward_kwargs)
+            hybrid_outputs = self.hybrid_module(x, **hybrid_forward_kwargs)
 
             # handle hybrid out
 
@@ -1949,10 +1841,6 @@ class Attention(Module):
 
             if hybrid_out.ndim == 3:
                 hybrid_out = rearrange(hybrid_out, 'b n (h d) -> b h n d', h = h)
-
-            if len(rest_hybrid_outs) > 0:
-                hybrid_hidden = first(rest_hybrid_outs)
-                intermediates.hybrid_hidden = hybrid_hidden
 
             out_norm, hybrid_out_norm = self.hybrid_norms
 
@@ -1980,11 +1868,7 @@ class Attention(Module):
 
         out = self.to_out(out)
 
-        # maybe sublayer dropout
-
-        out = maybe(self.sublayer_dropout)(out)
-
-        if exists(mask) and not exists(cache):
+        if exists(mask):
             out = einx.where('b n, b n d, -> b n d', mask, out, 0.)
 
         if not return_intermediates:
@@ -2065,7 +1949,6 @@ class AttentionLayers(Module):
         learned_value_residual_mix = True,   # seeing big improvements when the value residual mix value is learned per token - credit goes to @faresobeid for taking the first step with learned scalar mix, then @Blinkdl for taking it a step further with data dependent. here we will use per token learned
         rel_pos_kwargs: dict = dict(),
         residual_fn_kwargs: dict = dict(),
-        verbose = True,
         **kwargs
     ):
         super().__init__()
@@ -2083,9 +1966,6 @@ class AttentionLayers(Module):
         self.dim = dim
         self.causal = causal
         self.layers = ModuleList([])
-
-        self.attn_heads = heads
-        self.attn_dim_head = dim_head
 
         # routing related
         # 1. greater than one residual stream, proposed in Hyper-Connections paper https://arxiv.org/abs/2409.19606
@@ -2120,13 +2000,13 @@ class AttentionLayers(Module):
 
         assert rotary_emb_dim <= dim_head, f'rotary emb dim {rotary_emb_dim} must be less than or equal to attention head dimension {dim_head}'
 
-        if verbose and rotary_emb_dim < 32:
+        if rotary_emb_dim < 32:
             logger.warning('when training language model, rotary embedding dimension should be at least 32')
 
         assert not (rotary_xpos and not causal), 'rotary xpos is not compatible with bidirectional attention'
         self.rotary_pos_emb = RotaryEmbedding(rotary_emb_dim, use_xpos = rotary_xpos, scale_base = rotary_xpos_scale_base, interpolation_factor = rotary_interpolation_factor, base_rescale_factor = rotary_base_rescale_factor) if rotary_pos_emb else None
 
-        assert at_most_one_of(alibi_pos_bias, rel_pos_bias, data_dependent_alibi), 'you can only choose one of Alibi positional bias, data dependent Alibi (forgetting transformers), dynamic tanh, or T5 relative positional bias'
+        assert at_most_one_of(alibi_pos_bias, rel_pos_bias, data_dependent_alibi), 'you can only choose one of Alibi positional bias, data dependent Alibi (forgetting transformers), or T5 relative positional bias'
         assert rel_pos_num_buckets <= rel_pos_max_distance, 'number of relative position buckets must be less than the relative position max distance'
 
         # relative positional bias
@@ -2313,7 +2193,7 @@ class AttentionLayers(Module):
 
         # whether it has post norm
 
-        self.final_norm = norm_fn() if pre_norm and pre_norm_has_final_norm else nn.Identity()
+        self.final_norm = norm_fn() if pre_norm else nn.Identity()
 
         # whether unet or not
 
@@ -2447,24 +2327,13 @@ class AttentionLayers(Module):
         mems = None,
         mem_masks = None,
         seq_start_pos: Tensor | None = None,
-        seq_pos_offset: int = 0,
         cache: LayerIntermediates | None = None,
-        input_not_include_cache = False,
         cache_age = 1,
         return_hiddens = False,
         rotary_pos_emb = None,
         pos = None,
         context_pos = None,
         attn_bias = None,
-        deep_embeds_and_ids: tuple[nn.Parameter, Tensor] | None = None,
-        self_attn_additional_kv: (
-            LayerIntermediates |
-            list[tuple[Tensor, Tensor]]
-            | None
-        ) = None,
-        additional_kv_mask = None,
-        detach_additional_kv = False,
-        route_additional_kv_to_top = True,
         condition = None,
         in_attn_cond = None, # https://arxiv.org/abs/2105.04090
         layers_execute_order: tuple[int, ...] | None = None
@@ -2531,7 +2400,7 @@ class AttentionLayers(Module):
                 mem_len = maybe_mem.shape[1] if exists(maybe_mem) else 0
 
                 if not exists(pos):
-                    pos = arange(x.shape[1] + mem_len + seq_pos_offset, device = x.device) - mem_len
+                    pos = arange(x.shape[1] + mem_len, device = x.device) - mem_len
 
                 rotary_pos_emb = self.rotary_pos_emb(pos)
 
@@ -2548,14 +2417,10 @@ class AttentionLayers(Module):
 
         # assume cached key / values
 
-        prev_cache_length = 0
-
         attn_cache = []
 
         if exists(cache):
-            assert self.causal and not exists(attn_mask)
-
-            prev_cache_length = cache.cache_length
+            assert self.causal and not any([*map(exists, (mask, attn_mask))])
 
             if exists(context):
                 context = context[:, :0]
@@ -2563,27 +2428,9 @@ class AttentionLayers(Module):
             if cache_age > 0:
                 x = x[:, -cache_age:] # for spec decoding, may be greater than 1
 
-                if exists(deep_embeds_and_ids):
-                    deep_embeds, token_ids = deep_embeds_and_ids
-                    token_ids = token_ids[:, -cache_age:]
-                    deep_embeds_and_ids = (deep_embeds, token_ids)
-
             attn_cache = cache.attn_intermediates
 
-        next_cache_length = x.shape[1]
-
         iter_attn_cache = iter(attn_cache)
-
-        # handle deep embeds if needed
-
-        deep_embeds = []
-
-        if exists(deep_embeds_and_ids):
-            deep_embeds, token_ids = deep_embeds_and_ids
-            deep_embeds_across_depth = deep_embeds[token_ids]
-            deep_embeds = rearrange(deep_embeds_across_depth, 'b n l d -> l b n d')
-
-        deep_embeds_iter = iter(deep_embeds)
 
         # setup multistreams if needed
 
@@ -2607,23 +2454,6 @@ class AttentionLayers(Module):
 
         layers_execute_order = default(layers_execute_order, self.layers_execute_order)
         layer_variables = tuple(tuple(layer_variable[i] for i in layers_execute_order) for layer_variable in layer_variables)
-
-        # additional self attn key / values - say coming from vlm
-
-        if exists(self_attn_additional_kv) and route_additional_kv_to_top:
-
-            if isinstance(self_attn_additional_kv, LayerIntermediates):
-                self_attn_additional_kv = get_cached_kvs(self_attn_additional_kv)
-
-            if detach_additional_kv:
-                self_attn_additional_kv = detach_all(self_attn_additional_kv)
-
-            num_self_attns = sum([layer_type == 'a' for layer_type in first(layer_variables)])
-
-            self_attn_additional_kv = self_attn_additional_kv[-num_self_attns:]
-            self_attn_additional_kv = [None] * (num_self_attns - len(self_attn_additional_kv)) + self_attn_additional_kv
-
-        iter_self_attn_kv = iter(default(self_attn_additional_kv, ()))
 
         # derived input for reinjection if needed
 
@@ -2718,11 +2548,11 @@ class AttentionLayers(Module):
             # forward depending on layer type
 
             if layer_type == 'a':
-                out, inter = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, pos = pos, rotary_pos_emb = rotary_pos_emb, additional_key_values = next(iter_self_attn_kv, None), additional_key_value_mask = additional_kv_mask, prev_attn = prev_attn, cache = next(iter_attn_cache, None), mem = layer_mem, mem_mask = layer_mem_mask, attn_bias = attn_bias, value_residual = maybe_self_attn_value_residual, return_intermediates = True)
+                out, inter = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, pos = pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, cache = next(iter_attn_cache, None), mem = layer_mem, mem_mask = layer_mem_mask, attn_bias = attn_bias, value_residual = maybe_self_attn_value_residual, return_intermediates = True)
             elif layer_type == 'c':
                 out, inter = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn, cache = next(iter_attn_cache, None), value_residual = maybe_cross_attn_value_residual, **cross_attn_rotary_pos_emb, return_intermediates = True)
             elif layer_type == 'f':
-                out = block(x, deep_embed = next(deep_embeds_iter, None))
+                out = block(x)
 
             # store first self or cross attention intermediate for value residual
 
@@ -2775,7 +2605,6 @@ class AttentionLayers(Module):
             last_hidden = x,
             attn_intermediates = intermediates,
             layer_hiddens = layer_hiddens,
-            cache_length = next_cache_length + prev_cache_length
         )
 
         return x, intermediates
@@ -2823,57 +2652,6 @@ class PrefixDecoder(AttentionLayers):
 class CrossAttender(AttentionLayers):
     def __init__(self, **kwargs):
         super().__init__(cross_attend = True, only_cross = True, **kwargs)
-
-class AttentionPool(Module):
-    def __init__(
-        self,
-        dim,
-        num_pooled_tokens = 1,
-        dim_context = None,
-        add_residual = False,
-        depth = 1,
-        heads = 8,
-        dim_head = 64,
-        use_transformer_blocks = None,
-        squeeze_output = None,
-        attn_kwargs: dict = dict()
-    ):
-        super().__init__()
-        dim_context = default(dim_context, dim)
-
-        squeeze_output = default(squeeze_output, False)
-        assert not (squeeze_output and num_pooled_tokens > 1)
-
-        use_transformer_blocks = default(use_transformer_blocks, depth > 1)
-        assert use_transformer_blocks or depth == 1
-
-        self.queries = nn.Parameter(torch.randn(num_pooled_tokens, dim) * 1e-2)
-
-        if use_transformer_blocks:
-            assert not add_residual, 'residual already in effect when doing a full cross attention based transformer for pooling'
-            attn_kwargs = {f'attn_{k}': v for k, v in attn_kwargs.items()}
-
-            self.pooler = CrossAttender(dim = dim, cross_attn_dim_context = dim_context, depth = depth, heads = heads, attn_dim_head = dim_head, )
-        else:
-            self.pooler = Attention(dim = dim, dim_context = dim_context, heads = heads, dim_head = dim_head, **attn_kwargs)
-
-        self.add_residual = add_residual
-        self.squeeze_output = squeeze_output
-
-    def forward(self, context, mask = None):
-        batch = context.shape[0]
-
-        queries = repeat(self.queries, 'n d -> b n d', b = batch)
-
-        pooled = self.pooler(queries, context, context_mask = mask)
-
-        if self.add_residual:
-            pooled = pooled + queries
-
-        if self.squeeze_output:
-            pooled = rearrange(pooled, 'b 1 d -> b d')
-
-        return pooled
 
 class ViTransformerWrapper(Module):
     def __init__(
@@ -2985,24 +2763,16 @@ class TransformerWrapper(Module):
         average_pool_embed = False,
         use_cls_token = False,
         num_cls_tokens = 1,
-        attn_pool = False,
-        num_pooled_tokens = 1,
-        attn_pool_depth = 1,
-        dim_pooled_tokens = None,
         squeeze_out_last_dim = False,
         token_emb: TokenEmbedding | None = None,
         mixture_of_softmax = False,
         mixture_of_softmax_k = 4,
         sigsoftmax_logits = False,
-        ff_deep_embed = False,
         to_logits: Module | None = None,
-        add_continuous_pred_head = False
     ):
         super().__init__()
 
         dim = attn_layers.dim
-        depth = attn_layers.depth
-
         emb_dim = default(emb_dim, dim)
         self.emb_dim = emb_dim
         self.num_tokens = num_tokens
@@ -3035,16 +2805,6 @@ class TransformerWrapper(Module):
         if len(embed_num_tokens) > 0:
             self.embeds = ModuleDict({f'{name}_embed': nn.Embedding(num_tokens, emb_dim) for name, num_tokens in embed_num_tokens.items()})
 
-        # deep embed
-
-        # credit goes to Braden Koszarsky for first devising value embeddings in nanogpt-speedrun project
-        # then Bo Peng for coming up with this alternate design in feedforward for RWKV 8
-        # improvements were clearest to me (on my toy setup) with multiplying on output of feedforward, will try with attention at future date
-
-        self.ff_deep_embed = None
-        if ff_deep_embed:
-            self.ff_deep_embed = nn.Parameter(torch.ones(num_tokens, depth, dim))
-
         # fraction of the gradient that should go to the embedding, https://arxiv.org/abs/2105.13290
 
         self.emb_frac_gradient = emb_frac_gradient
@@ -3068,10 +2828,6 @@ class TransformerWrapper(Module):
 
         self.train_max_recycle_steps = train_max_recycle_steps
 
-        # either cls token or attn pool, but not both
-
-        assert not (use_cls_token and attn_pool)
-
         # classic cls token from the bert days
 
         self.cls_token = None
@@ -3079,13 +2835,6 @@ class TransformerWrapper(Module):
         if use_cls_token:
             self.cls_token = nn.Parameter(torch.zeros(num_cls_tokens, dim))
             nn.init.normal_(self.cls_token, std = 0.02)
-
-        # attn pool
-
-        self.attn_pool = None
-
-        if attn_pool:
-            self.attn_pool = AttentionPool(dim = default(dim_pooled_tokens, dim), dim_context = dim, num_pooled_tokens = num_pooled_tokens, depth = attn_pool_depth, heads = self.attn_layers.attn_heads, dim_head = self.attn_layers.attn_dim_head)
 
         # whether to average pool the embed (`global average pool`)
 
@@ -3128,18 +2877,6 @@ class TransformerWrapper(Module):
         else:
             self.to_logits = LinearNoBias(dim, logits_dim) if not exists(to_logits) else to_logits
 
-        # add a head that predicts the embedding of the next step
-
-        self.add_continuous_pred_head = add_continuous_pred_head
-
-        if add_continuous_pred_head:
-
-            self.to_next_embed_pred = nn.Sequential(
-                LinearNoBias(dim, dim),
-                nn.SiLU(),
-                LinearNoBias(dim, dim)
-            )
-
         # memory tokens (like [cls]) from Memory Transformers paper
 
         num_memory_tokens = default(num_memory_tokens, 0)
@@ -3174,7 +2911,6 @@ class TransformerWrapper(Module):
         return_intermediates = False,
         return_embeddings_and_intermediates = False,
         return_logit_entropies = False,
-        return_next_embed_pred = False,
         mask = None,
         return_mems = False,
         return_attn = False,
@@ -3190,7 +2926,6 @@ class TransformerWrapper(Module):
         attn_z_loss_weight = 1e-4,
         seq_start_pos = None,
         cache: LayerIntermediates | None = None,
-        input_not_include_cache = False,
         token_emb_kwargs = dict(),
         to_logits_kwargs = dict(),
         **kwargs,
@@ -3204,22 +2939,15 @@ class TransformerWrapper(Module):
 
         # shapes and variables
 
-        b, n, device, token_ids, num_mems, has_memory_tokens, emb_frac_gradient, orig_mask = x.shape[0], x.shape[1], x.device, x, self.num_memory_tokens, self.num_memory_tokens > 0, self.emb_frac_gradient, mask
+        b, n, device, num_mems, has_memory_tokens, emb_frac_gradient, orig_mask = x.shape[0], x.shape[1], x.device, self.num_memory_tokens, self.num_memory_tokens > 0, self.emb_frac_gradient, mask
 
         return_hiddens = return_mems | return_attn | return_intermediates | return_attn_z_loss | return_embeddings_and_intermediates
         return_embeddings = return_embeddings | (not exists(self.to_logits)) | return_embeddings_and_intermediates
 
-        # take care of position embedding offsets in the presence of cache and sequence is less than cache length (not full sequence)
-
-        seq_pos_offset = 0
-
-        if exists(cache) and input_not_include_cache:
-            seq_pos_offset = cache.cache_length
-
         # absolute positional embedding
 
         external_pos_emb = exists(pos) and pos.dtype != torch.long
-        pos_emb = self.pos_emb(x, pos = pos, seq_start_pos = seq_start_pos, offset = seq_pos_offset) if not external_pos_emb else pos
+        pos_emb = self.pos_emb(x, pos = pos, seq_start_pos = seq_start_pos) if not external_pos_emb else pos
         x = self.token_emb(x, **token_emb_kwargs) + pos_emb
 
         # add additional embeddings
@@ -3266,22 +2994,11 @@ class TransformerWrapper(Module):
             assert emb_frac_gradient > 0
             x = x * emb_frac_gradient + x.detach() * (1 - emb_frac_gradient)
 
-        # init embed
-
-        init_embed = x
-
         # embedding dropout
 
         x = self.emb_dropout(x)
 
         x = self.project_emb(x)
-
-        # maybe deep embeds
-
-        deep_embed_and_ids = None
-
-        if exists(self.ff_deep_embed):
-            deep_embed_and_ids = (self.ff_deep_embed, token_ids)
 
         # maybe cls token
 
@@ -3322,15 +3039,6 @@ class TransformerWrapper(Module):
             mems_l, mems_r = mems[:self.shift_mem_down], mems[self.shift_mem_down:]
             mems = [*mems_r, *mems_l]
 
-        # attn layers kwargs
-
-        kwargs = dict(
-            **kwargs,
-            seq_pos_offset = seq_pos_offset,
-            seq_start_pos = seq_start_pos,
-            input_not_include_cache = input_not_include_cache
-        )
-
         # attention layers
 
         if not self.recycling:
@@ -3338,7 +3046,7 @@ class TransformerWrapper(Module):
 
             # regular
 
-            attended, intermediates = self.attn_layers(x, mask = mask, mems = mems, mem_masks = mem_masks, cache = cache, deep_embeds_and_ids = deep_embed_and_ids, return_hiddens = True, **kwargs)
+            attended, intermediates = self.attn_layers(x, mask = mask, mems = mems, mem_masks = mem_masks, cache = cache, return_hiddens = True, seq_start_pos = seq_start_pos, **kwargs)
 
         else:
             # recycling
@@ -3355,7 +3063,7 @@ class TransformerWrapper(Module):
                 with context():
                     maybe_recycled = self.recycled_proj(attended.detach()) if not first_step else 0.
 
-                    attended, intermediates = self.attn_layers(x + maybe_recycled, mask = mask, mems = mems, mem_masks = mem_masks, cache = cache, return_hiddens = True, **kwargs)
+                    attended, intermediates = self.attn_layers(x + maybe_recycled, mask = mask, mems = mems, mem_masks = mem_masks, cache = cache, return_hiddens = True, seq_start_pos = seq_start_pos, **kwargs)
 
         x = attended
 
@@ -3374,38 +3082,14 @@ class TransformerWrapper(Module):
 
             x = x[:, :mem_seq]
 
-        # store last layer hiddens, for access in case of cls token or attention pooling
-
-        intermediates.last_layer_hiddens = x
-
         # global average pool
 
         if self.average_pool_embed:
             x = masked_mean(x, mask = orig_mask, dim = 1)
 
-        # cls token(s)
-
         if exists(self.cls_token):
-            x, last_layer_hiddens = unpack(x, cls_packed_shape, 'b * d')
-
-            intermediates.last_layer_hiddens = last_layer_hiddens
-
-            if x.shape[1] == 1:
-                x = rearrange(x, 'b 1 d -> b d')  # Remove sequence dimension if num_cls_tokens=1 to keep previous behavior
-
-        # attention pool
-
-        is_encoder = not self.attn_layers.causal
-        return_pooled_tokens = exists(self.attn_pool) and is_encoder
-
-        if (
-            exists(self.attn_pool) and
-            (return_intermediates or is_encoder) # in a new paper, they use attention pooling on decoder - so we'll default to returning pooled tokens if encoder, but for decoder, they must set `return_intermediates`
-        ):
-
-            attn_pooled_tokens = self.attn_pool(x, mask = mask)
-
-            intermediates.attn_pooled_tokens = attn_pooled_tokens
+            x, _ = unpack(x, cls_packed_shape, 'b * d')
+            x = x.squeeze(1)  # Remove sequence dimension if num_cls_tokens=1 to keep previous behavior
 
         # handle expansion to mixture if needed (for mixture of softmax)
 
@@ -3452,19 +3136,8 @@ class TransformerWrapper(Module):
             out = (x, intermediates)
         elif return_embeddings:
             out = x
-        elif return_pooled_tokens:
-            intermediates.logits = logits
-            out = attn_pooled_tokens
         else:
             out = logits
-
-        # maybe next embed pred
-
-        if return_next_embed_pred:
-            assert self.add_continuous_pred_head
-            next_embed_out = self.to_next_embed_pred(x)
-
-            out = (out, (next_embed_out, init_embed))
 
         # logit entropies
 
@@ -3546,7 +3219,11 @@ class XTransformer(Module):
     @torch.no_grad()
     def generate(self, seq_in, seq_out_start, seq_len, mask = None, attn_mask = None, **kwargs):
         encodings = self.encoder(seq_in, mask = mask, attn_mask = attn_mask, return_embeddings = True)
-        return self.decoder.generate(seq_out_start, seq_len, context = encodings, context_mask = mask, **kwargs)
+        return self.decoder.generate_beam_search(seq_out_start, seq_len, context = encodings, context_mask = mask, **kwargs)
+
+    def generate_ground_truth_possibilities(self, seq_in, tgt, seq_out_start, seq_len, mask = None, attn_mask = None, **kwargs):
+        encodings = self.encoder(seq_in, mask = mask, attn_mask = attn_mask, return_embeddings = True)
+        return self.decoder.calc_ground_truth_possibilities(seq_out_start, tgt, seq_len, context = encodings, context_mask = mask, **kwargs)
 
     def forward(self, src, tgt, mask = None, attn_mask = None, src_prepend_embeds = None):
 
