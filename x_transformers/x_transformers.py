@@ -2653,6 +2653,57 @@ class CrossAttender(AttentionLayers):
     def __init__(self, **kwargs):
         super().__init__(cross_attend = True, only_cross = True, **kwargs)
 
+class AttentionPool(Module):
+    def __init__(
+        self,
+        dim,
+        num_pooled_tokens = 1,
+        dim_context = None,
+        add_residual = False,
+        depth = 1,
+        heads = 8,
+        dim_head = 64,
+        use_transformer_blocks = None,
+        squeeze_output = None,
+        attn_kwargs: dict = dict()
+    ):
+        super().__init__()
+        dim_context = default(dim_context, dim)
+
+        squeeze_output = default(squeeze_output, False)
+        assert not (squeeze_output and num_pooled_tokens > 1)
+
+        use_transformer_blocks = default(use_transformer_blocks, depth > 1)
+        assert use_transformer_blocks or depth == 1
+
+        self.queries = nn.Parameter(torch.randn(num_pooled_tokens, dim) * 1e-2)
+
+        if use_transformer_blocks:
+            assert not add_residual, 'residual already in effect when doing a full cross attention based transformer for pooling'
+            attn_kwargs = {f'attn_{k}': v for k, v in attn_kwargs.items()}
+
+            self.pooler = CrossAttender(dim = dim, cross_attn_dim_context = dim_context, depth = depth, heads = heads, attn_dim_head = dim_head, )
+        else:
+            self.pooler = Attention(dim = dim, dim_context = dim_context, heads = heads, dim_head = dim_head, **attn_kwargs)
+
+        self.add_residual = add_residual
+        self.squeeze_output = squeeze_output
+
+    def forward(self, context, mask = None):
+        batch = context.shape[0]
+
+        queries = repeat(self.queries, 'n d -> b n d', b = batch)
+
+        pooled = self.pooler(queries, context, context_mask = mask)
+
+        if self.add_residual:
+            pooled = pooled + queries
+
+        if self.squeeze_output:
+            pooled = rearrange(pooled, 'b 1 d -> b d')
+
+        return pooled
+
 class ViTransformerWrapper(Module):
     def __init__(
         self,
